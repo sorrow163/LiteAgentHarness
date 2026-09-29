@@ -1,0 +1,54 @@
+# LiteAgentHarness 的配置 —— **要改配置就改这份文件**。
+#
+# 加载顺序：**命令行参数 > 这份文件 > 代码里的默认值**（默认值见 src/config.py 顶部那排 DEFAULT_*）。
+# 只有两项是必填的：model.base_url 与 model.api_key —— 少了它们连请求都发不出去，会当场报错。
+# 其余每一项都可以整行删掉，删掉就用代码里的默认值。
+
+model:
+  base_url: https://api.deepseek.com          # 必填：模型端点
+  api_key: sk-YOUR_API_KEY            # 必填：API key
+  name: deepseek-v4-flash                 # 模型名
+  provider: deepseek          # 只写进会话元信息，并用于"思考模式写法"这类判断
+  kwargs:                       # 直通给 OpenAI 客户端的参数（temperature / extra_body 等）
+    extra_body: # 嵌套的用更深的缩进
+      thinking:
+        type: enabled
+
+
+summarizer:
+  name:                           # 留空 = 与主模型相同（另起一个不绑工具的实例）
+
+harness:
+  permission_mode: ask            # readonly / ask / accept_edits / yolo
+  max_turns: 40                   # 一轮最多几次模型调用
+  max_context_tokens: 1024000       # 上下文预算：超了先清旧工具结果，压不动再交给摘要模型
+
+capabilities:                     # 下面三项都是"配了才有"
+  sandbox: true                   # true = 多一个 sandbox_bash（宿主内写受限令牌，只挡写不挡读）
+  skills_dir:                     # 留空 = 看 <工作区>/.harness/skills
+  subagents:                      # 注册了才有 `task` 工具；没写 tools 的默认拿父代理那套编码工具
+                                  # （**不含** sandbox_bash —— 子代理跑不了命令，只会读和写）
+#    - name: explorer
+#      description: 只读探索代码库：读若干文件后把结论压成几条要点返回（不写文件、不跑命令）
+#      system_prompt: >-
+#        你是探索者。只读文件，只返回结论：把读到的证据压成几条要点，别把大段代码贴回来。
+#        有疑问就连着结论一起返回，不要把问题抛回给调用方。
+
+
+ui:
+  fold_chars: 100                 # 思考块超过这么多字符就折起来
+
+mcp:
+  config:                         # MCP server 配置文件的路径；**留空 = 不接 MCP**。
+                                  # 相对路径按**这份 config.yml 所在目录**解析。
+                                  # 那份文件长这样（JSON 或 YAML 都行，JSON 本身就是 YAML 的子集）：
+                                  #   mcpServers:
+                                  #     filesystem:                # 键 = server 名
+                                  #       command: npx             # 要启动的命令（绝对路径或 PATH 里的名字）
+                                  #       args: ["-y", "@modelcontextprotocol/server-filesystem", "D:/work"]
+                                  #       env:                      # 追加给子进程的环境变量（可选）
+                                  #         GITHUB_TOKEN: xxx
+                                  #       timeout_s: 30             # 单次请求超时秒数（可选，默认 30）
+                                  # 启动时会**先把这一份整份校验完**：在不在、能不能解析、有没有
+                                  # mcpServers、每一项的 command/args/env/timeout_s 类型对不对、
+                                  # 命令找不找得到。任一条不过就报错并且**停止启动**。
