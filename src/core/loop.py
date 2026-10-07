@@ -4,6 +4,8 @@ import queue
 import time
 import copy
 from collections.abc import  Callable, Generator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Sequence, Any
 
@@ -11,11 +13,11 @@ from typing import Sequence, Any
 from src.core.context import ContextManager
 from src.core.errors import ToolBindError
 from src.core.events import Event, get_new_id, EventType, DataKey, StopReason, Outcome, CompactionStrategy, \
-    ApprovalRequest, now_ms, ApprovalSource, ApprovalDecision, ErrorReason
+    ApprovalRequest, now_ms, ApprovalSource, ApprovalDecision, ErrorReason, ToolType
 from src.core.message import Messages, AIMessage, to_jsonable, HumanMessage, Usage, SystemMessage, ToolCall
 from src.core.models import BaseChatModel
 from src.core.runtime import RunContext, set_run, reset_run
-from src.core.tool import Tool, ExecOptions, execute_tool_call, CallVerdict, DenySource, denied_result
+from src.core.tool import Tool, ToolResult, ExecOptions, execute_tool_call, CallVerdict, DenySource, denied_result
 
 
 def _digest(messages: Messages) -> str:
@@ -57,6 +59,14 @@ def _compaction_event(result, run_id: str) -> Event:
         if result.summarizer_usage is not None:
             data["summarizer_usage"] = result.summarizer_usage
     return Event(type=EventType.COMPACTION, run_id=run_id, span=get_new_id(), data=data)
+
+
+#: 一轮里最多**同时**跑几个委派。多出来的在池子里排队。
+#:
+#: 它不是配置项，因为"并发"是**委派这种调用的语义**（一轮里发多个委派，就是模型在说这几件事
+#: 互不依赖），不需要谁去开关它。但池子必须有个上限：一轮里最多能发 `max_tool_calls_per_turn`
+#: （默认 32）个调用，全是委派的话就是 32 条线程同时各跑一个完整 loop、各自再调模型。
+MAX_CONCURRENT_DELEGATIONS = 8
 
 
 @dataclass
@@ -166,8 +176,8 @@ class Agent:
     # ---- 主循环 ----
     def run(self, user_input: str, *, prior_messages: Messages = None,
             run_id: str = None, session_span: str = None, memory: str = "",
-            memory_sources: Sequence[str] = (),
-            workspace: str = None, result_dir: str = None, default_timeout_s: float = None) -> Generator[Event]:
+            memory_sources: Sequence[str] = (),  workspace: str = None, result_dir: str = None,
+            default_timeout_s: float = None) -> Generator[Event]:
         """执行一次 run，逐条 ``yield`` 事件。
 
         一次 run = "用户说一句话 → agent 给出最终回答"。**结论不从这里返回**：
@@ -339,7 +349,24 @@ class Agent:
             #
             #    `approval_resolver`：给了它就**不 yield**、就地取答案（子代理用它 —— 子代理内部不审批，一律按"没有人可问"处理）。
             exec_options = ExecOptions(workspace=workspace, result_dir=result_dir, default_timeout_s=default_timeout_s)
-            for tool_call in ai.tool_calls:
+            # 这一批调用分两路：**委派**（`task`）并发跑，其余一律串行。
+            #
+            # 为什么委派要并发：一轮里发多个委派，本来就是模型在说"这几件事互不依赖"，串行跑
+            # 等于把它们等网络的时间叠起来。
+            # 为什么其余的仍然串行：普通工具大多在改工作区（写文件、跑命令），并发会让两个工具
+            # 同时动同一份东西，或者让一个工具读到别人刚写了一半的文件。那不是线程安全问题，
+            # 是语义顺序问题，加锁也解决不了。
+            #
+            # 事件顺序有一条硬约束：**写进文件的 `tool_result` 顺序要与 `ai.tool_calls` 的顺序
+            # 一致**，因为 `messages` 的顺序由它决定，而重放与下一轮真正发出去的历史都靠它。
+            # 所以从**第一个真的被派出去的委派**往后，结果先攒着，等委派跑完再按调用顺序统一发；
+            # 委派之前那些照旧发完就发。没有委派的批次（绝大多数）`hold_from` 一直是 `None`，
+            # 走的就是老路：跑一条发一条，界面逐条完成。
+            held: list[tuple[int, ToolResult, str]] = []
+            pending: list[tuple[int, ToolCall, str]] = []
+            hold_from: int | None = None
+
+            for index, tool_call in enumerate(ai.tool_calls):
                 # ① 开 span：**派发之前**
                 tool_span = get_new_id()
                 yield Event(type=EventType.TOOL_START, run_id=run_id, turn=turn, span=tool_span, parent_span=run_span,
@@ -359,35 +386,42 @@ class Agent:
                         self._audit("approval", to_execute, "deny", by, reason)
                         verdict = CallVerdict(action="deny", call=to_execute, reason=reason,
                                               source=DenySource.DENY_POLICY, risk=verdict.risk)
-                # ④ 执行或装配拒绝结果
+                # ④ 三条路：拒绝 / 委派（攒着，这一批跑完再并发跑）/ 其余（就地串行跑完）
                 if verdict.is_denied:
                     result = denied_result(to_execute, verdict.reason, verdict.source, verdict.risk)
+                elif self._is_delegation(to_execute):
+                    if hold_from is None:
+                        hold_from = index      # 被拒绝的委派走不到这里，所以它不会白攒一批
+                    pending.append((index, to_execute, tool_span))
+                    continue
                 else:
                     result = execute_tool_call(to_execute, self.tools, exec_options)
-                # ⑤ 结果立刻落盘：**逐条 start → result**。攒到最后一起发就等于又变成
-                #    "整批跑完再补发"（TUI 看不到逐条完成，多条调用的事件形状也乱了）。
-                tool_data: dict[str, Any] = {
-                    DataKey.DURATION_MS: result.duration_ms,
-                    DataKey.OUTCOME: result.outcome,
-                    DataKey.TOOL_TYPE: result.tool_type,
-                    DataKey.MESSAGE: result.message,
-                }
-                if result.truncated_from is not None:
-                    tool_data[DataKey.TRUNCATED_FROM] = result.truncated_from
-                if result.spilled_to is not None:
-                    tool_data[DataKey.SPILLED_TO] = result.spilled_to
-                if result.child_session is not None:
-                    tool_data[DataKey.CHILD_SESSION] = result.child_session
+
+                # ⑤ 结果落盘：**逐条 start → result**。攒到最后一起发就等于又变成"整批跑完再补发"
+                #    （界面看不到逐条完成）；只有"这一批里有委派"时才不得不攒后面那几条。
+                if hold_from is not None and index > hold_from:
+                    held.append((index, result, tool_span))
+                    continue
+                yield self._tool_result_event(run_id=run_id, turn=turn, tool_span=tool_span, result=result)
+                messages.append(result.message)
                 if result.usage is not None:
-                    tool_data[DataKey.USAGE] = result.usage
                     # ★ 子代理花的也算这个 run 的：`result.usage` 是那棵子树的**全量**
                     #   （子代理自己的调用 ＋ 压缩 ＋ 它再委派的下级），所以直接累进去 ——
                     #   `RUN_END.usage` 就等于这个 run 烧掉的全部。想单独看委派那一块，
                     #   把本 run 里 `kind="subagent"` 的 `tool_result.usage` 加起来就是。
                     total_usage = total_usage + result.usage
-                yield Event(type=EventType.TOOL_RESULT, run_id=run_id, turn=turn,
-                            span=tool_span, data=tool_data)
+
+            # ⑥ 委派并发跑完，再按**调用顺序**把攒下的结果发出去、回填历史。
+            #    回填顺序必须与 `ai.tool_calls` 一致：那是"这一次请求"的形状，重放与下一轮
+            #    发出去的历史都按它还原。`held` 非空时一定要发完 —— 它是被攒下的结果，
+            #    不是可以省掉的东西。
+            if pending:
+                held.extend(self._run_delegations(pending, exec_options))
+            for index, result, tool_span in sorted(held, key=lambda item: item[0]):
+                yield self._tool_result_event(run_id=run_id, turn=turn, tool_span=tool_span, result=result)
                 messages.append(result.message)
+                if result.usage is not None:
+                    total_usage = total_usage + result.usage
 
         yield Event(
             type=EventType.RUN_END, run_id=run_id, span=run_span,
@@ -412,6 +446,61 @@ class Agent:
         if self.summarizer is not None:
             return self.context.summarize(messages, self.summarizer)
         return None
+
+    # ---- 委派：认出来、并发跑 ----
+    def _is_delegation(self, call: ToolCall) -> bool:
+        """这次调用是不是**委派**（`task`）。
+
+        判据是注册表里那个工具的 `tool_type`，不是名字：`tool_type` 是建工具时定下来的
+        （`subagent.py` 建 `task` 时给的就是 `SUBAGENT`），而名字有可能被外围换掉。
+        查不到这个工具就当它不是委派 —— 那种调用本来也会被权限层按"名字不在已知清单里"拒掉。
+        """
+        tool = self.tools.get(call.name) if isinstance(self.tools, dict) else None
+        return tool is not None and tool.tool_type == ToolType.SUBAGENT
+
+    def _run_delegations(self, pending: list[tuple[int, ToolCall, str]],
+                         exec_options: ExecOptions) -> list[tuple[int, ToolResult, str]]:
+        """把这一批委派**并发**跑掉，返回 ``[(调用下标, 结果, span)]``（顺序不保证）。
+
+        ★ **工作线程只做一件事：调 `execute_tool_call`。** 事件、`messages`、`total_usage`
+        全留在主线程 —— 这个进程里只有主线程往会话文件里写东西，这条不破。
+
+        ★ **运行期上下文要显式复制进线程。** `contextvars` 不跟着线程走，而 `task` 工具一进去
+        第一件事就是 `get_run()` / `get_call()`（拿父 run 的 run_id、工作区、结果目录、记忆，
+        以及这次调用的 call_id）。不复制的话它们在子线程里是空的，委派当场散架。每个分派
+        各复制一份：同一个 `Context` 不能被两个线程同时进。
+        """
+        results: list[tuple[int, ToolResult, str]] = []
+        workers = min(len(pending), MAX_CONCURRENT_DELEGATIONS)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="delegate") as pool:
+            futures = {}
+            for index, call, span in pending:
+                context = copy_context()
+                futures[pool.submit(context.run, execute_tool_call, call, self.tools,
+                                    exec_options)] = (index, span)
+            for future in as_completed(futures):
+                index, span = futures[future]
+                results.append((index, future.result(), span))
+        return results
+
+    @staticmethod
+    def _tool_result_event(*, run_id: str, turn: int, tool_span: str, result: ToolResult) -> Event:
+        """`ToolResult` → `tool_result` 事件（含那几个**按需**才出现的键）。"""
+        data: dict[str, Any] = {
+            DataKey.DURATION_MS: result.duration_ms,
+            DataKey.OUTCOME: result.outcome,
+            DataKey.TOOL_TYPE: result.tool_type,
+            DataKey.MESSAGE: result.message,
+        }
+        if result.truncated_from is not None:
+            data[DataKey.TRUNCATED_FROM] = result.truncated_from
+        if result.spilled_to is not None:
+            data[DataKey.SPILLED_TO] = result.spilled_to
+        if result.child_session is not None:
+            data[DataKey.CHILD_SESSION] = result.child_session
+        if result.usage is not None:
+            data[DataKey.USAGE] = result.usage
+        return Event(type=EventType.TOOL_RESULT, run_id=run_id, turn=turn, span=tool_span, data=data)
 
     # ---- 判定与审批（与执行分开：判在前、跑在后） ----
     def _judge(self, call: ToolCall) -> CallVerdict:

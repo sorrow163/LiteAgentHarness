@@ -191,7 +191,7 @@ class Harness:
             "model": getattr(self.cfg.model, "model", type(self.cfg.model).__name__),
             "provider": getattr(self.cfg.model, "provider", "unknown"),
             "harness": "LiteAgentHarness@0.1.0",
-            "config": {"permission_mode": self.cfg.permission_mode, "parallel_tools": False,
+            "config": {"permission_mode": self.cfg.permission_mode,
                        "max_turns": self.cfg.max_turns,
                        "max_context_tokens": self.cfg.max_context_tokens,
                        "session_root": self.cfg.session_root,
@@ -341,9 +341,14 @@ class Harness:
         self.policy.known = frozenset(t.name for t in tools)
 
         self._agent = Agent(
-            model=self.cfg.model, tools=tools, system_prompt=self.cfg.system_prompt,
-            max_turns=self.cfg.max_turns, context=context,
-            judge=self.judge, propose=self.policy.propose, audit=self._audit,
+            model=self.cfg.model,
+            tools=tools,
+            system_prompt=self.cfg.system_prompt,
+            max_turns=self.cfg.max_turns,
+            context=context,
+            judge=self.judge,
+            propose=self.policy.propose,
+            audit=self._audit,
             summarizer=self.cfg.summarizer)
 
     # ---- 生命周期 ----

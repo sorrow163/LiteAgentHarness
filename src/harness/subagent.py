@@ -1,3 +1,4 @@
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -13,6 +14,11 @@ from src.core.tool import Tool, SubagentOutcome
 
 #: 子代理 system prompt 追加段：约束它别把问题抛回给用户。
 _NO_ASK_BACK = "\n\n除非父代理明确要求，否则不要把问题抛回给用户；有疑问就把结论与疑问一起返回给父代理。"
+
+#: 取号 + 建文件那一小段的锁。一轮里的多个委派是**并发**跑的（见 `core/loop.py` 的
+#: `_run_delegations`），而编号是"扫磁盘算第一个空位"算出来的 —— 两个线程中间插一下就会
+#: 算出同一个 N。`store.create` 拒绝覆盖，所以撞名不会写坏文件，只是那次委派白丢。
+_CHILD_ID_LOCK = threading.Lock()
 
 
 def _next_child_id(store: Any, parent_session_id: str) -> str:
@@ -74,8 +80,13 @@ def make_task_tool(subagents: Sequence[SubagentDef], default_model: BaseChatMode
         call_ctx = get_call()                # 本次调用的 call_id / name
         started = time.monotonic()
 
-        # 子会话：独立文件，head.parent = 父会话 id
-        child_id = _next_child_id(store, parent_session_id)
+        # 子会话：独立文件，head.parent = 父会话 id。
+        # ★ 取号与建文件必须在**同一把锁**里（并发的一批委派会同时走到这儿）。
+        with _CHILD_ID_LOCK:
+            child_id = _next_child_id(store, parent_session_id)
+            child_meta = dict(meta or {})
+            child_meta["agent"] = spec.name
+            child = store.create(child_id, parent=parent_session_id, meta=child_meta)
 
         # 深度没到底 → 子代理的工具箱里再放一把 task（指向同一批子代理，深度 +1）
         tools = list(spec.tools)
@@ -84,11 +95,6 @@ def make_task_tool(subagents: Sequence[SubagentDef], default_model: BaseChatMode
                                         parent_session_id=child_id, meta=meta,
                                         judge=judge, summarizer=summarizer,
                                         max_depth=max_depth, _depth=_depth + 1))
-
-
-        child_meta = dict(meta or {})
-        child_meta["agent"] = spec.name
-        child = store.create(child_id, parent=parent_session_id, meta=child_meta)
 
         sub = Agent(
             model=spec.model or default_model,
